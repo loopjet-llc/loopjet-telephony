@@ -1,0 +1,33 @@
+name: Loopjet upstream sync
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-develop
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: develop
+      - name: Fast-forward upstream
+        env:
+          UPSTREAM_REPOSITORY: frappe/telephony
+          UPSTREAM_BRANCH: develop
+        run: |
+          git config user.name "loopjet-upstream-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          git merge --ff-only "upstream/$UPSTREAM_BRANCH"
+          git push origin "$UPSTREAM_BRANCH"
