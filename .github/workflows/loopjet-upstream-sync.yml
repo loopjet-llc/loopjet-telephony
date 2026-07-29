@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: develop
-      - name: Fast-forward upstream
+      - name: Sync upstream source
         env:
           UPSTREAM_REPOSITORY: frappe/telephony
           UPSTREAM_BRANCH: develop
@@ -29,5 +29,20 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
           git fetch upstream "$UPSTREAM_BRANCH"
-          git merge --ff-only "upstream/$UPSTREAM_BRANCH"
+          upstream_ref="upstream/$UPSTREAM_BRANCH"
+          upstream_sha="$(git rev-parse "$upstream_ref")"
+          patch_file="$RUNNER_TEMP/upstream-source.patch"
+
+          # The repository token cannot update workflow definitions. Keep
+          # Loopjet's workflows isolated while mirroring all product source.
+          git diff --binary HEAD "$upstream_ref" -- . \
+            ':(exclude).github/workflows/**' > "$patch_file"
+
+          if [[ ! -s "$patch_file" ]]; then
+            echo "Product source is already current with $UPSTREAM_REPOSITORY@$upstream_sha"
+            exit 0
+          fi
+
+          git apply --index --binary "$patch_file"
+          git commit -m "chore(mirror): sync $UPSTREAM_REPOSITORY@$upstream_sha"
           git push origin "$UPSTREAM_BRANCH"
