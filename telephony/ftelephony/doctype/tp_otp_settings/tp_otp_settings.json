@@ -1,0 +1,145 @@
+{
+ "actions": [],
+ "creation": "2026-08-05 08:22:40.145444",
+ "default_view": "List",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "section_break_enable",
+  "enabled",
+  "enable_email_otp",
+  "column_break_enable",
+  "sms_from_number",
+  "send_sms_rate_limit_per_hour",
+  "section_break_otp",
+  "otp_length",
+  "otp_expiry_in_seconds",
+  "column_break_otp",
+  "otp_max_attempts",
+  "otp_message_template",
+  "email_otp_subject"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_break_enable",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable SMS (Twilio)"
+  },
+  {
+   "default": "0",
+   "description": "Sends OTPs over email using Frappe's configured outgoing Email Account, independent of Twilio.",
+   "fieldname": "enable_email_otp",
+   "fieldtype": "Check",
+   "label": "Enable Email OTP"
+  },
+  {
+   "fieldname": "column_break_enable",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "enabled",
+   "description": "Twilio phone number (with country code) that SMS messages are sent from. Must be an SMS-capable number on the connected Twilio account.",
+   "fieldname": "sms_from_number",
+   "fieldtype": "Data",
+   "label": "SMS From Number",
+   "mandatory_depends_on": "eval: doc.enabled"
+  },
+  {
+   "default": "60",
+   "depends_on": "enabled",
+   "description": "Maximum plain SMS one client may send per hour via send_sms. Set to 0 for no limit — do that only when a trusted backend does the sending. OTP endpoints are limited separately, per recipient.",
+   "fieldname": "send_sms_rate_limit_per_hour",
+   "fieldtype": "Int",
+   "label": "Send SMS Rate Limit (per hour)",
+   "non_negative": 1
+  },
+  {
+   "depends_on": "eval: doc.enabled || doc.enable_email_otp",
+   "fieldname": "section_break_otp",
+   "fieldtype": "Section Break",
+   "label": "OTP"
+  },
+  {
+   "default": "6",
+   "fieldname": "otp_length",
+   "fieldtype": "Int",
+   "label": "OTP Length",
+   "non_negative": 1
+  },
+  {
+   "default": "300",
+   "description": "Time in seconds before a generated OTP expires.",
+   "fieldname": "otp_expiry_in_seconds",
+   "fieldtype": "Int",
+   "label": "OTP Expiry (In Seconds)",
+   "non_negative": 1
+  },
+  {
+   "fieldname": "column_break_otp",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "5",
+   "description": "Number of incorrect attempts allowed before an OTP is invalidated.",
+   "fieldname": "otp_max_attempts",
+   "fieldtype": "Int",
+   "label": "OTP Max Attempts",
+   "non_negative": 1
+  },
+  {
+   "default": "Your OTP is {otp}. It is valid for {expiry_minutes} minutes.",
+   "description": "Use {otp} and {expiry_minutes} as placeholders. Used for both SMS and Email.",
+   "fieldname": "otp_message_template",
+   "fieldtype": "Small Text",
+   "label": "OTP Message Template"
+  },
+  {
+   "default": "Your verification code",
+   "depends_on": "enable_email_otp",
+   "fieldname": "email_otp_subject",
+   "fieldtype": "Data",
+   "label": "Email OTP Subject"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-08-05 08:22:40.145444",
+ "modified_by": "Administrator",
+ "module": "FTelephony",
+ "name": "TP OTP Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "TP Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

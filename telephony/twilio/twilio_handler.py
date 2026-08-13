@@ -26,7 +26,10 @@ class Twilio:
     @classmethod
     def connect(self):
         """Make a twilio connection."""
-        settings = frappe.get_doc("TP Twilio Settings")
+        # Cached: this runs on every send, and the settings are a Single that
+        # changes rarely. Both save() and db.set_single_value() call
+        # clear_document_cache, so the credentials cannot go stale here.
+        settings = frappe.get_cached_doc("TP Twilio Settings")
         if not (settings and settings.enabled):
             return
         return Twilio(settings=settings)
