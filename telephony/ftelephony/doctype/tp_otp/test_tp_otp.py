@@ -26,7 +26,9 @@ PHONE_BUDGET = "+911234500004"
 PHONE_RESET = "+911234500005"
 PHONE_NORMALIZE = "+911234500006"
 PHONE_REDACT = "+911234500007"
+PHONE_OTHER = "+911234500008"
 TEST_EMAIL = "test-otp@example.com"
+TEST_EMAIL_OTHER = "other-otp@example.com"
 
 TEST_RECIPIENTS = [
     PHONE_VERIFY,
@@ -36,30 +38,26 @@ TEST_RECIPIENTS = [
     PHONE_RESET,
     PHONE_NORMALIZE,
     PHONE_REDACT,
+    PHONE_OTHER,
     TEST_EMAIL,
+    TEST_EMAIL_OTHER,
 ]
 
 
 class IntegrationTestTPOTP(IntegrationTestCase):
-    """Integration tests for TP OTP, exercising the SMS and Email OTP flows
-    end-to-end with the actual Twilio/email dispatch mocked out."""
+    """SMS and Email OTP flows end-to-end, with dispatch mocked out."""
 
     def setUp(self):
         super().setUp()
 
-        # TP OTP Settings.validate() confirms sms_from_number against the live
-        # Twilio account. These tests never reach Twilio, so stub that one
-        # check rather than skipping validation wholesale — the OTP parameter
-        # validation still runs.
+        # Stub only the live-Twilio check, so the rest of validate() still runs.
         patcher = patch.object(
             TPOTPSettings, "validate_sms_from_number", return_value=None
         )
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # TP Twilio Settings.validate() authenticates against the live Twilio
-        # API and on_update() provisions API keys there; neither is reachable
-        # from tests. Stub both so change_settings can drive the doc normally.
+        # Both reach the live Twilio API; stub them so change_settings works.
         for method in ("validate_twilio_account", "on_update"):
             twilio_patcher = patch.object(TPTwilioSettings, method, return_value=None)
             twilio_patcher.start()
@@ -86,15 +84,29 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self.addCleanup(settings.__exit__, None, None, None)
         frappe.clear_cache(doctype="TP OTP Settings")
 
+        # This counter lives in Redis, which outlives the transaction rollback.
+        self.addCleanup(frappe.cache.delete_keys, "tp-otp-rl:")
+
         self.addCleanup(self._delete_test_records)
 
     def _delete_test_records(self):
         frappe.db.delete("TP OTP", {"recipient": ["in", TEST_RECIPIENTS]})
         frappe.db.delete("TP SMS Log", {"to": ["in", TEST_RECIPIENTS]})
 
+    def _capture_bucket(self, seen, wrapped=None):
+        """Read the bucket from inside the endpoint: call_channel_endpoint
+        restores form_dict on the way out."""
+        from telephony.otp import RATE_LIMIT_FIELD
+
+        def side_effect(*args, **kwargs):
+            seen.append(frappe.form_dict.get(RATE_LIMIT_FIELD))
+            if wrapped:
+                return wrapped(*args, **kwargs)
+
+        return side_effect
+
     def _log_sent_sms(self, to, message, purpose="OTP"):
-        """Stand in for dispatch_sms, but still write a real TP SMS Log so the
-        redaction behaviour under test is exercised."""
+        """Stand in for dispatch_sms, but write a real TP SMS Log."""
         from telephony.twilio.sms import create_sms_log
 
         return create_sms_log(
@@ -133,8 +145,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_generate_response_never_carries_the_code(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """The response is returned to unauthenticated callers, so it must not
-        echo the OTP back under any site configuration."""
+        """The response goes to guests, so it must never echo the OTP."""
         from telephony.twilio.sms import generate_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -169,8 +180,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_regenerating_otp_does_not_reset_attempt_budget(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """Requesting a fresh OTP must not hand out a new attempt budget while
-        the previous one is still live, else the max-attempts cap is toothless."""
+        """A resend must not hand out a new attempt budget while the previous
+        OTP is still live."""
         from telephony.twilio.sms import generate_otp, verify_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -185,9 +196,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             GENERIC_FAILURE,
         )
 
-        # Resending is refused outright rather than issuing a code that starts
-        # at the cap: no SMS is paid for, and no new row is created to carry a
-        # refreshed expires_at.
+        # Refused outright: no SMS paid for, no row with a refreshed expiry.
         with self.assertRaises(frappe.ValidationError):
             generate_otp(phone_number=PHONE_BUDGET, purpose="Login")
 
@@ -208,10 +217,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_resending_while_locked_out_does_not_extend_the_lockout(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """Carrying attempts forward onto a row with a *fresh* expires_at made
-        the lockout self-perpetuating: every resend inside the window pushed the
-        expiry a full window further out while billing for a dead code, so a user
-        who reacted by retrying — the normal reaction — never got back in."""
+        """A resend inside the lockout window must not push the expiry a full
+        window further out, or retrying keeps the user locked out forever."""
         from telephony.twilio.sms import generate_otp, verify_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -258,8 +265,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_attempt_budget_resets_once_window_lapses(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """The carry-forward above must not become a permanent lockout: once the
-        previous OTP is no longer live, a fresh request starts clean."""
+        """The carry-forward must not become a permanent lockout."""
         from telephony.twilio.sms import generate_otp, verify_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -298,8 +304,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_otp_body_is_not_written_to_sms_log(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """TP SMS Log is readable by TP Agent and kept for 90 days, so storing
-        the rendered code there would defeat hashing it in TP OTP."""
+        """TP SMS Log is agent-readable and kept 90 days."""
         from telephony.twilio.sms import generate_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -322,8 +327,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     @patch("telephony.twilio.sms.dispatch_sms")
     @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
     def test_rate_limit_key_is_normalized(self, mock_generate_code, mock_dispatch_sms):
-        """frappe.rate_limit buckets on form_dict[key] verbatim, so the key has
-        to be canonical or the send cap is bypassable by reformatting."""
+        """rate_limit buckets on form_dict[key] verbatim, so the key has to be
+        canonical or the cap is bypassable by reformatting."""
         from telephony.otp import RATE_LIMIT_FIELD
         from telephony.twilio.sms import generate_otp
 
@@ -341,18 +346,23 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         )
 
     def test_unusable_recipients_share_one_bucket(self):
-        """A recipient that cannot be canonicalized must not become its own
-        bucket: with the raw string as the key, varying the garbage minted fresh
-        quota against the address it would ultimately resolve to. They also must
-        not leave the key *empty*, which makes rate_limit throw its own "Either
-        key or IP flag is required" in place of the endpoint's message."""
+        """Uncanonicalizable recipients share one bucket, so varying the garbage
+        cannot mint quota — but the key must not be left empty either."""
         from telephony.email_otp import clean_email
-        from telephony.otp import INVALID_RECIPIENT, RATE_LIMIT_FIELD, rate_limit_bucket
+        from telephony.otp import (
+            INVALID_RECIPIENT,
+            RATE_LIMIT_FIELD,
+            RATE_LIMIT_WINDOW,
+            rate_limit_bucket,
+        )
 
         self.addCleanup(frappe.form_dict.pop, "email", None)
         self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
 
-        @rate_limit_bucket("email", clean_email, "email:generate")
+        # generous limit: this asserts the bucket key, not the cap.
+        @rate_limit_bucket(
+            "email", clean_email, "email:generate", 100, RATE_LIMIT_WINDOW
+        )
         def endpoint(email=None):
             return frappe.form_dict[RATE_LIMIT_FIELD]
 
@@ -372,10 +382,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_email_bucket_agrees_with_the_recipient_that_would_be_stored(
         self, mock_dispatch_email
     ):
-        """clean_email used to fall back to the raw string when parseaddr bailed,
-        while validate_email_address's per-piece fallback still resolved it — so
-        "victim@x.com,," bucketed separately but delivered to victim@x.com, and
-        each extra comma bought another untouched 5-per-10-minutes."""
+        """The bucket must be the address that gets stored: otherwise
+        "victim@x.com,," buckets apart but still delivers to victim@x.com."""
         from telephony.email_otp import clean_email
         from telephony.email_otp import generate_otp as generate_email_otp
 
@@ -386,11 +394,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
         mock_dispatch_email.assert_not_called()
 
-        # The invariant, stated directly: for anything that *is* accepted, the
-        # bucket clean_email produces has to be the recipient that gets stored.
-        # parseaddr resolves more than it rejects — "a@x.com," loses the comma,
-        # "a@x.com x" becomes "a@x.comx" — and that is fine as long as the two
-        # sides agree, which is what this checks.
+        # The invariant: for anything accepted, the bucket clean_email produces
+        # has to be the recipient that gets stored.
         from telephony.email_otp import validate_single_email
 
         for accepted in (TEST_EMAIL, f"{TEST_EMAIL},", f" {TEST_EMAIL.upper()} "):
@@ -428,8 +433,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_email_otp_is_case_insensitive(
         self, mock_generate_code, mock_dispatch_email
     ):
-        """Case variants must resolve to one recipient, both for storage and for
-        rate-limit bucketing."""
+        """Case variants must resolve to one recipient."""
         from telephony.email_otp import generate_otp as generate_email_otp
         from telephony.email_otp import verify_otp as verify_email_otp
 
@@ -447,8 +451,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
     @patch("telephony.email_otp.dispatch_email_otp")
     def test_email_otp_rejects_multiple_addresses(self, mock_dispatch_email):
-        """validate_email_address() accepts a comma-separated list and returns
-        it re-joined, which would store two addresses as one recipient."""
+        """validate_email_address() accepts a list and returns it re-joined,
+        which would store two addresses as one recipient."""
         from telephony.email_otp import generate_otp as generate_email_otp
 
         with self.assertRaises(frappe.ValidationError):
@@ -460,9 +464,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
     @patch("telephony.email_otp.dispatch_email_otp")
     def test_email_otp_rejects_newline_separated_addresses(self, mock_dispatch_email):
-        """A newline is the separator that slips past a split_emails() count:
-        split_emails collapses \\n to a space before splitting, while
-        validate_email_address turns it into a comma and returns both."""
+        """A newline is the separator that slips past a split_emails() count."""
         from telephony.email_otp import generate_otp as generate_email_otp
 
         for separator in ("\n", "\r"):
@@ -475,8 +477,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         mock_dispatch_email.assert_not_called()
 
     def test_email_otp_is_redacted_from_the_email_queue(self):
-        """Email Queue keeps the rendered body for 30 days, so the queued OTP
-        must not outlive its own expiry in cleartext."""
+        """Email Queue keeps the body for 30 days."""
         import inspect
 
         from telephony.email_otp import dispatch_email_otp
@@ -493,9 +494,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
     def test_clean_phone_number_rejects_non_ascii_digits(self):
         """str.isdigit() is true for fullwidth/Arabic-Indic digits, which
-        MariaDB's utf8mb4_unicode_ci then compares equal to their ASCII form —
-        so they must not survive normalization. Rejected, not dropped: dropping
-        them would leave a shorter number that is still deliverable."""
+        utf8mb4_unicode_ci then compares equal to their ASCII form."""
         from telephony.twilio.sms import clean_phone_number
 
         # fullwidth ９１ and Arabic-Indic ٩١ both pass str.isdigit()
@@ -504,9 +503,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self.assertEqual(clean_phone_number("+91 12345-00001"), "+911234500001")
 
     def test_clean_phone_number_rejects_rather_than_absorbing_stray_input(self):
-        """Silently dropping unexpected characters rewrites one number into a
-        different, deliverable one — so the OTP reaches a stranger who never
-        asked for it. "1. +919876543210" used to yield +1919876543210."""
+        """Dropping unexpected characters rewrites one number into a different,
+        deliverable one: "1. +919876543210" yielded +1919876543210."""
         from telephony.twilio.sms import clean_phone_number
 
         for rejected in (
@@ -520,8 +518,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
     def test_clean_phone_number_canonicalizes_to_one_e164_string(self):
         """Every spelling of one number must collapse to one string: it is both
-        the TP OTP lookup key and the rate-limit bucket, so `91...` and `+91...`
-        being distinct meant one number held two of each."""
+        the TP OTP lookup key and the rate-limit bucket."""
         from telephony.twilio.sms import clean_phone_number
 
         canonical = "+917977396938"
@@ -535,8 +532,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         ):
             self.assertEqual(clean_phone_number(spelling), canonical, spelling)
 
-        # a bare "+" must come back empty so the "provide a valid phone number"
-        # checks still fire, rather than handing Twilio a "+"
+        # a bare "+" must come back empty, so the downstream checks still fire
         for empty in ("", "   ", "+", "++", None):
             self.assertEqual(clean_phone_number(empty), "")
 
@@ -545,8 +541,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_otp_verifies_regardless_of_number_spelling(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """The live consequence of the above: a code requested with one
-        spelling has to verify with another."""
+        """A code requested with one spelling has to verify with another."""
         from telephony.twilio.sms import generate_otp, verify_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -575,9 +570,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     @patch("telephony.twilio.sms.Twilio")
     def test_dispatch_sms_failure_is_generic_and_audited(self, MockTwilio):
         """The raised message must not carry Twilio internals, and the Failed
-        row must still be written — via Redis, not via a commit. A commit here
-        would also commit the *caller's* pending writes, so a Twilio outage
-        would persist a calling doc hook's half-finished work."""
+        row must still be written — via Redis, not via a commit."""
         from telephony.twilio.sms import dispatch_sms
 
         client = MockTwilio.connect.return_value.twilio_client
@@ -610,7 +603,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     @patch("telephony.twilio.sms.Twilio")
     def test_dispatch_sms_failure_payload_survives_json(self, MockTwilio):
         """deferred_insert json.dumps() the record, so a datetime in it would
-        raise TypeError and lose the audit row outright."""
+        lose the audit row outright."""
         import json
 
         from telephony.twilio.sms import build_sms_log
@@ -622,9 +615,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
     @patch("telephony.twilio.sms.Twilio")
     def test_dispatch_sms_rejects_input_it_could_not_audit(self, MockTwilio):
-        """`to` and `message` are mandatory on TP SMS Log, so an empty one made
-        the failure path's own audit write raise MandatoryError — losing the
-        Failed row and masking the real error. Reject before sending instead."""
+        """Both are mandatory on TP SMS Log, so an empty one would make the
+        failure path's own audit write raise and mask the real error."""
         from telephony.twilio.sms import dispatch_sms
 
         client = MockTwilio.connect.return_value.twilio_client
@@ -641,11 +633,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self.assertFalse(frappe.db.exists("TP SMS Log", {"to": ""}))
 
     def _drive_rate_limiter(self, path, cmd=None):
-        """The limiter is inert without frappe.request, so give it one.
-
-        `cmd` is left unset by default because that is the /api/v2 shape: only
-        /api/v1 populates it, and rate_limit's cache key interpolates it.
-        """
+        """The limiter is inert without frappe.request, so give it one. `cmd`
+        is unset by default because that is the /api/v2 shape."""
         from frappe.utils import set_request
 
         from telephony.otp import RATE_LIMIT_FIELD
@@ -667,8 +656,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_rate_limit_actually_throttles_sends(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """The limiter is inert without frappe.request, so the other tests never
-        exercise it. Drive it with a request context and prove it fires."""
+        """The limiter is inert without frappe.request; drive it with one."""
         from telephony.twilio.sms import generate_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -689,9 +677,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self, mock_generate_code, mock_dispatch_sms
     ):
         """rate_limit defaults to ip_based=True, which makes the identity
-        `ip:recipient` — so the cap documented as per-recipient was really
-        per-(IP, recipient), and rotating IPs bought unlimited SMS to one number
-        along with the Twilio bill for them."""
+        `ip:recipient`, so rotating IPs buys unlimited SMS to one number."""
         from telephony.twilio.sms import generate_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -713,10 +699,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_generate_and_verify_do_not_share_a_rate_limit_counter(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """rate_limit's cache key is rl:{form_dict.cmd}:{identity}:{seconds} and
-        only /api/v1 sets cmd. Over /api/v2 it renders as None, so generate and
-        verify — same key, same identity, same 600s window — collided on one
-        counter and four failed verifies blocked the next resend."""
+        """rate_limit's cache key interpolates cmd, which only /api/v1 sets, so
+        over /api/v2 generate and verify collide on one counter."""
         from telephony.twilio.sms import generate_otp, verify_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -743,9 +727,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
     @patch("telephony.twilio.sms.dispatch_sms")
     def test_send_sms_is_rate_limited_and_configurable(self, mock_dispatch_sms):
-        """send_sms sends arbitrary content to arbitrary numbers at real cost,
-        so it needs a cap — but a hardcoded one would break bulk senders, hence
-        the setting."""
+        """send_sms costs real money, so it needs a configurable cap."""
         from frappe.utils import set_request
 
         from telephony.twilio.sms import get_send_sms_limit, send_sms
@@ -785,9 +767,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             self.assertGreater(get_send_sms_limit(), 1000)
 
     def test_send_sms_limit_does_not_fail_open_when_unconfigured(self):
-        """A Single holds no value for a field until first save, so an existing
-        site reads None here. That must not be read as "unlimited" — only an
-        explicit 0 opts out."""
+        """An unsaved Single reads None here, which must not mean "unlimited"."""
         from telephony.twilio.sms import DEFAULT_SEND_SMS_LIMIT, get_send_sms_limit
 
         with patch("frappe.get_cached_value", return_value=None):
@@ -800,8 +780,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             self.assertEqual(get_send_sms_limit(), 25)
 
     def test_verify_pays_the_kdf_cost_on_every_failure_path(self):
-        """The failure body is uniform; the latency has to be too, or a guest
-        can time-probe which recipients have a live OTP."""
+        """The failure body is uniform; the latency has to be too."""
         from telephony import otp as otp_module
 
         recipient = PHONE_ATTEMPTS
@@ -832,10 +811,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             self.assertEqual(mock_equalize.call_count, 3)
 
     def test_guest_may_call_otp_endpoints_but_not_send_sms(self):
-        """Guest access is decided by frappe.is_whitelisted against the exact
-        object registered at decoration time. Since normalize_form_field wraps
-        the function *under* @frappe.whitelist, a mistake in that stacking would
-        silently drop guest registration — so assert it directly."""
+        """Guest access is decided against the exact object registered at
+        decoration time, so a mistake in decorator stacking drops it silently."""
         from telephony import email_otp
         from telephony.twilio import sms
 
@@ -853,8 +830,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             with self.assertRaises(frappe.PermissionError):
                 frappe.is_whitelisted(sms.send_sms)
 
-        # POST-only: GET skips Frappe's CSRF check, so a state-changing
-        # whitelisted method must not accept it.
+        # POST-only: GET skips Frappe's CSRF check.
         for fn in [*guest_callable, sms.send_sms]:
             self.assertEqual(
                 tuple(frappe.allowed_http_methods_for_whitelisted_func[fn]), ("POST",)
@@ -878,3 +854,176 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
         result = send_sms(to=PHONE_VERIFY, message="hi")
         self.assertEqual(result["status"], "Sent")
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_and_verify_otp_resolve_the_channel(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """The entry point other apps use, reached with a channel name."""
+        from telephony.otp import send_otp, verify_otp
+
+        purpose = "Loan Lead LN-LEAD-00001"
+
+        result = send_otp(TEST_EMAIL, "Email", purpose=purpose)
+        self.assertEqual(set(result), {"sent", "expires_in"})
+        mock_dispatch_email.assert_called_once()
+
+        # the purpose scopes the code: another purpose must not match it
+        self.assertEqual(
+            verify_otp(TEST_EMAIL, "Email", "777666", purpose="Verification"),
+            GENERIC_FAILURE,
+        )
+        self.assertEqual(
+            verify_otp(TEST_EMAIL, "Email", "777666", purpose=purpose),
+            {"verified": True},
+        )
+
+    def test_unknown_channel_is_rejected(self):
+        """The channel names a module to import, so it is validated first."""
+        from telephony.otp import send_otp, verify_otp
+
+        for channel in ("Carrier Pigeon", "sms", "", None):
+            with self.assertRaises(frappe.ValidationError):
+                send_otp(TEST_EMAIL, channel)
+            with self.assertRaises(frappe.ValidationError):
+                verify_otp(TEST_EMAIL, channel, "777666")
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_otp_buckets_its_rate_limit_per_recipient(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """Without send_otp publishing the recipient into form_dict, every
+        recipient shares one site-wide cap."""
+        from telephony.otp import send_otp
+
+        seen = []
+        mock_dispatch_email.side_effect = self._capture_bucket(seen)
+
+        self._drive_rate_limiter("/api/method/telephony.otp.send_otp")
+
+        # limit is 5 per 10 minutes, per recipient
+        for _ in range(5):
+            send_otp(TEST_EMAIL, "Email")
+
+        self.assertEqual(seen[-1], f"email:generate:{TEST_EMAIL}")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            send_otp(TEST_EMAIL, "Email")
+
+        # a different recipient keeps a budget of their own
+        send_otp(TEST_EMAIL_OTHER, "Email")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_send_and_verify_otp_resolve_the_sms_channel(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """The SMS half of the registry: the recipient reaches the endpoint
+        under the field name OTP_CHANNELS claims it takes."""
+        from telephony.otp import send_otp, verify_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+        purpose = "Loan Lead LN-LEAD-00001"
+
+        result = send_otp(PHONE_VERIFY, "SMS", purpose=purpose)
+        self.assertEqual(set(result), {"sent", "expires_in"})
+        mock_dispatch_sms.assert_called_once()
+        self.assertEqual(mock_dispatch_sms.call_args.args[0], PHONE_VERIFY)
+
+        self.assertEqual(
+            verify_otp(PHONE_VERIFY, "SMS", "123456", purpose="Verification"),
+            GENERIC_FAILURE,
+        )
+        self.assertEqual(
+            verify_otp(PHONE_VERIFY, "SMS", "123456", purpose=purpose),
+            {"verified": True},
+        )
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_send_otp_buckets_its_rate_limit_per_recipient_over_sms(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """Same per-recipient bucketing as the email case, on the channel whose
+        recipient field differs from it."""
+        from telephony.otp import send_otp
+
+        seen = []
+        mock_dispatch_sms.side_effect = self._capture_bucket(seen, self._log_sent_sms)
+
+        self._drive_rate_limiter("/api/method/telephony.otp.send_otp")
+
+        # limit is 5 per 10 minutes, per recipient
+        for _ in range(5):
+            send_otp(PHONE_VERIFY, "SMS")
+
+        self.assertEqual(seen[-1], f"sms:generate:{PHONE_VERIFY}")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            send_otp(PHONE_VERIFY, "SMS")
+
+        # a different recipient keeps a budget of their own
+        send_otp(PHONE_OTHER, "SMS")
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_otp_leaves_form_dict_as_it_found_it(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """Left behind, the recipient is PII that frappe writes into Error Log
+        metadata on any later unhandled exception in the same request."""
+        from telephony.otp import RATE_LIMIT_FIELD, send_otp
+
+        self.addCleanup(frappe.form_dict.pop, "email", None)
+        self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
+
+        # a caller with an 'email' parameter of its own must get it back intact
+        frappe.form_dict.email = "caller-value"
+        send_otp(TEST_EMAIL, "Email")
+        self.assertEqual(frappe.form_dict.email, "caller-value")
+
+        # and one that never had the key must not acquire it
+        frappe.form_dict.pop("email", None)
+        frappe.form_dict.pop(RATE_LIMIT_FIELD, None)
+        send_otp(TEST_EMAIL_OTHER, "Email")
+        self.assertNotIn("email", frappe.form_dict)
+        self.assertNotIn(RATE_LIMIT_FIELD, frappe.form_dict)
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_otp_is_rate_limited_without_a_request(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """frappe's @rate_limit returns early when frappe.request is None, so on
+        a background job the cap is not merely wrong but absent."""
+        from telephony.otp import send_otp
+
+        # an unbound LocalProxy here, not None — falsy either way
+        self.assertFalse(frappe.request, "this test must run off the request path")
+
+        for _ in range(5):
+            send_otp(TEST_EMAIL, "Email")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            send_otp(TEST_EMAIL, "Email")
+
+        # still bucketed per recipient, not one shared counter
+        send_otp(TEST_EMAIL_OTHER, "Email")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_non_string_recipient_is_rejected_by_type_not_by_crash(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """A mistyped recipient must fail as a type error, not as an
+        AttributeError from inside the rate-limit decorator."""
+        from telephony.otp import send_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        with self.assertRaises(frappe.exceptions.FrappeTypeError):
+            send_otp(911234500001, "SMS")
+
+        mock_dispatch_sms.assert_not_called()
